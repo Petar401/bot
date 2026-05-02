@@ -38,6 +38,21 @@ class RiskLimits:
     max_position_pct: float = 0.20            # cap per single symbol
 
 
+# Equity tickers, kept as an opt-in alternative universe.
+TOP_EQUITIES: tuple[str, ...] = ("AAPL", "MSFT", "SPY")
+
+# Top-20 crypto pairs quoted in USDT (rough market-cap order; adjust to taste).
+# Symbols use the exchange-standard concatenated form (e.g. BTCUSDT) so they
+# map directly to ``./data/{SYMBOL}_{TIMEFRAME}.csv`` and to most exchange
+# REST/WebSocket APIs (Binance, Bybit testnet, etc.).
+TOP_CRYPTO_USDT_PAIRS: tuple[str, ...] = (
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "TRXUSDT", "LINKUSDT",
+    "DOTUSDT", "MATICUSDT", "TONUSDT", "SHIBUSDT", "LTCUSDT",
+    "BCHUSDT", "NEARUSDT", "UNIUSDT", "XLMUSDT", "ATOMUSDT",
+)
+
+
 @dataclass
 class Config:
     # --- Mode flags ---------------------------------------------------------
@@ -45,9 +60,11 @@ class Config:
     LIVE_TRADING: bool = False                # MUST stay False; tripwire only
 
     # --- Universe -----------------------------------------------------------
-    symbols: tuple[str, ...] = ("AAPL", "MSFT", "SPY")
+    # Default to the top-20 crypto/USDT pairs. Override via CLI --symbols
+    # or by setting cfg.symbols = TOP_EQUITIES for the stock universe.
+    symbols: tuple[str, ...] = TOP_CRYPTO_USDT_PAIRS
     timeframe: str = "1d"                     # used for CSV filename suffix
-    base_currency: str = "USD"
+    base_currency: str = "USDT"
 
     # --- Capital + risk -----------------------------------------------------
     starting_cash: float = 100_000.0

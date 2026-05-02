@@ -27,10 +27,19 @@ import pandas as pd
 
 from backtest import run_backtest, save_results
 from broker import SimulatedBroker, build_broker
-from config import Config, LiveTradingBlocked, load_config
+from config import (
+    Config, LiveTradingBlocked, load_config,
+    TOP_CRYPTO_USDT_PAIRS, TOP_EQUITIES,
+)
 from data_feed import OfflineCSVDataFeed, build_data_feed
 from portfolio import Portfolio
 from strategy import build_strategy
+
+
+UNIVERSES: dict[str, tuple[str, ...]] = {
+    "crypto": TOP_CRYPTO_USDT_PAIRS,
+    "equities": TOP_EQUITIES,
+}
 
 
 def _setup_logging(logs_dir: Path) -> None:
@@ -219,7 +228,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--symbols", type=_parse_symbols, default=None,
-                        help="Comma-separated, e.g. AAPL,MSFT")
+                        help="Comma-separated, e.g. BTCUSDT,ETHUSDT")
+    common.add_argument("--universe", choices=sorted(UNIVERSES.keys()), default=None,
+                        help="Preset universe. Ignored if --symbols is given.")
     common.add_argument("--timeframe", type=str, default=None)
     common.add_argument("--start", type=str, default=None)
     common.add_argument("--end", type=str, default=None)
@@ -252,6 +263,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cash is not None:
         cfg.starting_cash = args.cash
+
+    # --symbols wins; otherwise --universe replaces the default symbol set.
+    if args.symbols is None and getattr(args, "universe", None):
+        args.symbols = list(UNIVERSES[args.universe])
 
     _setup_logging(cfg.logs_dir)
     log = logging.getLogger("runner")

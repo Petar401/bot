@@ -34,22 +34,40 @@ timestamp, open, high, low, close, volume
 
 `timestamp` may also be named `datetime`, `date`, or `time`.
 
+## Universes
+
+Two built-in universes are exposed as constants in `config.py`:
+
+- `TOP_CRYPTO_USDT_PAIRS` (default): top-20 crypto pairs quoted in USDT —
+  `BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT, ADAUSDT, DOGEUSDT,
+  AVAXUSDT, TRXUSDT, LINKUSDT, DOTUSDT, MATICUSDT, TONUSDT, SHIBUSDT,
+  LTCUSDT, BCHUSDT, NEARUSDT, UNIUSDT, XLMUSDT, ATOMUSDT`.
+- `TOP_EQUITIES`: `AAPL, MSFT, SPY`.
+
+Pick one via `--universe crypto|equities`, or override entirely with
+`--symbols BTCUSDT,ETHUSDT,...`.
+
 ## Run
 
-Offline backtest (no network):
+Offline backtest on the default crypto universe (no network):
 ```bash
-python runner.py backtest --symbols AAPL,MSFT --timeframe 1d \
+python runner.py backtest --universe crypto --timeframe 1d \
     --start 2022-01-01 --end 2024-12-31 --cash 100000
+```
+
+Same, but only a subset:
+```bash
+python runner.py backtest --symbols BTCUSDT,ETHUSDT,SOLUSDT --timeframe 1d
 ```
 
 Replay local data 'as if live' (no network):
 ```bash
-python runner.py paper_offline_replay --symbols AAPL --timeframe 1d --speed 0
+python runner.py paper_offline_replay --symbols BTCUSDT --timeframe 1h --speed 0
 ```
 
 Live paper (requires you to fill in the connector adapters first):
 ```bash
-python runner.py paper_live --symbols AAPL --timeframe 1d
+python runner.py paper_live --universe crypto --timeframe 1h
 ```
 
 ## Wiring up your connectors
