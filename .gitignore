@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Generated artifacts (keep dirs via .gitkeep)
+logs/*
+reports/*
+data/*
+!logs/.gitkeep
+!reports/.gitkeep
+!data/.gitkeep
