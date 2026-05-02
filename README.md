@@ -70,18 +70,51 @@ Live paper (requires you to fill in the connector adapters first):
 python runner.py paper_live --universe crypto --timeframe 1h
 ```
 
-## Wiring up your connectors
+## Wiring up your Claude connectors
 
-Two adapter surfaces are the only places that should reach the network:
+All network I/O goes through Claude with `mcp_servers` configured — no raw
+HTTP. Four adapter methods are the only network surface, and every one of
+them refuses to run while `cfg.OFFLINE_MODE=True`:
 
 - `data_feed.ConnectorDataFeed.fetch_bars_via_connector`
 - `data_feed.ConnectorDataFeed.fetch_history_via_connector`
 - `broker.ConnectorBroker.submit_paper_order_via_connector`
 - `broker.ConnectorBroker.fetch_account_via_connector`
 
-Implement these against your MCP tools / paper API (Alpaca paper, Bybit
-testnet, Public.com MCP, ...) and flip `OFFLINE_MODE=False`. Everything else
-stays untouched.
+Each one builds a prompt and forwards it to a single shared helper,
+`_call_claude_with_mcp(cfg, prompt, mcp_url_key, mcp_name_key)`, which is
+where the Anthropic SDK call lives. Populate `cfg.connector` with:
+
+```
+anthropic_api_key       sk-ant-...
+claude_model            e.g. claude-sonnet-4-6
+market_data_mcp_url     https://your-market-data-mcp.example.com
+market_data_mcp_name    market-data
+broker_mcp_url          https://your-paper-broker-mcp.example.com
+broker_mcp_name         paper-broker
+```
+
+Then implement the body of `_call_claude_with_mcp` (the docstring shows the
+exact `client.messages.create(..., mcp_servers=[...])` shape) and flip
+`OFFLINE_MODE=False`. Everything else stays untouched.
+
+## Example: BTCUSDT 1h backtest
+
+```bash
+python examples/btcusdt_1h_demo.py
+```
+
+Reads `./data/BTCUSDT_1h.csv` (auto-generates synthetic data on first run
+if missing) and runs:
+
+```bash
+python runner.py backtest --symbols BTCUSDT --timeframe 1h \
+    --start 2023-01-01 --end 2024-01-01 --cash 10000 --tag btcusdt_1h_demo
+```
+
+Outputs land in `reports/btcusdt_1h_demo_{equity_curve.csv,fills.csv,metrics.json}`.
+Crypto pairs (any symbol ending in `USDT`/`USDC`/`BUSD`/...) are sized to 4
+decimal places automatically; equities still floor to whole shares.
 
 ## Safety guarantees
 

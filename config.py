@@ -87,8 +87,14 @@ class Config:
     reports_dir: Path = field(default_factory=lambda: REPORTS_DIR)
 
     # --- Connector adapter config (filled in by the user) ------------------
-    # These are intentionally placeholders. Adapter methods in data_feed /
-    # broker read from this dict. None of the offline paths touch them.
+    # Adapter methods in data_feed / broker read from this dict. None of the
+    # offline paths touch them. Recommended keys when wiring up Claude MCP:
+    #   "anthropic_api_key"         : sk-ant-...
+    #   "claude_model"              : e.g. "claude-sonnet-4-6"
+    #   "market_data_mcp_url"       : URL of your market-data MCP server
+    #   "market_data_mcp_name"      : friendly name for that MCP server
+    #   "broker_mcp_url"            : URL of your paper-broker MCP server
+    #   "broker_mcp_name"           : friendly name for that MCP server
     connector: dict[str, str] = field(default_factory=dict)
 
     def ensure_dirs(self) -> None:
@@ -98,6 +104,23 @@ class Config:
 
 class LiveTradingBlocked(RuntimeError):
     """Raised when a live/mainnet code path is reached."""
+
+
+class OfflineModeViolation(RuntimeError):
+    """Raised when a network path is invoked while ``OFFLINE_MODE=True``."""
+
+
+def require_online(cfg: "Config", what: str) -> None:
+    """Refuse to make a network call while ``OFFLINE_MODE=True``.
+
+    Use this at the top of every connector adapter so the bot is safe to run
+    with Wi-Fi disabled even if a caller forgets to branch on OFFLINE_MODE.
+    """
+    if cfg.OFFLINE_MODE:
+        raise OfflineModeViolation(
+            f"Refusing to call {what}: OFFLINE_MODE=True. "
+            "Flip cfg.OFFLINE_MODE=False to enable network adapters."
+        )
 
 
 def _scan_env_for_live_endpoints(env: dict[str, str] | None = None) -> list[str]:

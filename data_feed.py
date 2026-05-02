@@ -1,21 +1,29 @@
 """Unified data feed.
 
 - Offline: load OHLCV CSV/Parquet from ``./data/{symbol}_{timeframe}.{csv|parquet}``.
-- Online:  call user-provided MCP/HTTP connectors via clearly marked adapters.
+- Online:  call user-provided Claude connectors / MCP servers via clearly
+           marked adapter methods. No raw HTTP — everything goes through Claude
+           with ``mcp_servers`` configured, so the user controls the toolset.
 
 Backtest and paper_offline_replay use ONLY the offline path. Online adapters
-are opt-in stubs the user fills in.
+short-circuit with ``OfflineModeViolation`` whenever ``cfg.OFFLINE_MODE`` is
+True, so the code is safe to run with Wi-Fi disabled.
 """
 from __future__ import annotations
 
+import json
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
-from config import Config
+from config import Config, require_online
+
+
+log = logging.getLogger(__name__)
 
 
 OHLCV_COLUMNS: tuple[str, ...] = ("open", "high", "low", "close", "volume")
@@ -134,17 +142,17 @@ def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 # Online (connector-backed) — adapter stubs
 # ---------------------------------------------------------------------------
 class ConnectorDataFeed(DataFeed):
-    """Online feed backed by user-supplied MCP/HTTP connectors.
+    """Online feed backed by Claude + your MCP market-data server.
 
-    The two ``*_via_connector`` methods are the ONLY place that should reach
-    the network. Wire them up to your Alpaca / Bybit testnet / Public.com /
-    MCP tools — but keep their signatures so the rest of the bot stays pure.
+    All adapter methods refuse to run while ``cfg.OFFLINE_MODE=True``. The
+    actual network call goes through the Anthropic SDK with ``mcp_servers``
+    configured, so the user's Claude connectors do the I/O — not raw HTTP.
     """
 
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
 
-    # ---- Adapter methods (fill in with your MCP/HTTP connector) ----------
+    # ---- Adapter methods (Claude + MCP) ---------------------------------
     def fetch_bars_via_connector(
         self,
         symbol: str,
@@ -152,14 +160,31 @@ class ConnectorDataFeed(DataFeed):
         limit: int = 200,
         end: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
-        """ADAPTER STUB. Replace with a real connector call.
+        """STUB. Calls Claude with the user's market-data MCP server attached.
 
         Must return a DataFrame indexed by timestamp with columns:
-        open, high, low, close, volume.
+        ``open, high, low, close, volume``.
         """
+        if not self.cfg.OFFLINE_MODE:
+            require_online(self.cfg, "fetch_bars_via_connector")
+            prompt = (
+                f"Use the configured market-data MCP tool to fetch the last "
+                f"{limit} {timeframe} OHLCV bars for {symbol}"
+                + (f" ending at {end.isoformat()}" if end is not None else "")
+                + ". Reply with ONLY a JSON array of objects with keys "
+                "timestamp, open, high, low, close, volume."
+            )
+            payload = _call_claude_with_mcp(
+                cfg=self.cfg,
+                prompt=prompt,
+                mcp_url_key="market_data_mcp_url",
+                mcp_name_key="market_data_mcp_name",
+            )
+            return _rows_to_ohlcv_df(payload)
         raise NotImplementedError(
             "ConnectorDataFeed.fetch_bars_via_connector is not wired up. "
-            "Implement it against your MCP/HTTP connector, or run in OFFLINE_MODE."
+            "Set OFFLINE_MODE=False, populate cfg.connector with your Claude+MCP "
+            "config, and finish the stub above."
         )
 
     def fetch_history_via_connector(
@@ -169,7 +194,22 @@ class ConnectorDataFeed(DataFeed):
         start: pd.Timestamp,
         end: pd.Timestamp,
     ) -> pd.DataFrame:
-        """ADAPTER STUB. Replace with a real connector call."""
+        """STUB. Same shape as fetch_bars_via_connector but for a date range."""
+        if not self.cfg.OFFLINE_MODE:
+            require_online(self.cfg, "fetch_history_via_connector")
+            prompt = (
+                f"Use the configured market-data MCP tool to fetch {timeframe} "
+                f"OHLCV bars for {symbol} from {start.isoformat()} to "
+                f"{end.isoformat()}. Reply with ONLY a JSON array of objects "
+                "with keys timestamp, open, high, low, close, volume."
+            )
+            payload = _call_claude_with_mcp(
+                cfg=self.cfg,
+                prompt=prompt,
+                mcp_url_key="market_data_mcp_url",
+                mcp_name_key="market_data_mcp_name",
+            )
+            return _rows_to_ohlcv_df(payload)
         raise NotImplementedError(
             "ConnectorDataFeed.fetch_history_via_connector is not wired up."
         )
@@ -182,6 +222,11 @@ class ConnectorDataFeed(DataFeed):
         limit: int = 200,
         end: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
+        if self.cfg.OFFLINE_MODE:
+            raise RuntimeError(
+                "ConnectorDataFeed.get_latest_bars called in OFFLINE_MODE; "
+                "use OfflineCSVDataFeed instead."
+            )
         return self.fetch_bars_via_connector(symbol, timeframe, limit, end)
 
     def get_history(
@@ -191,7 +236,57 @@ class ConnectorDataFeed(DataFeed):
         start: pd.Timestamp,
         end: pd.Timestamp,
     ) -> pd.DataFrame:
+        if self.cfg.OFFLINE_MODE:
+            raise RuntimeError(
+                "ConnectorDataFeed.get_history called in OFFLINE_MODE; "
+                "use OfflineCSVDataFeed instead."
+            )
         return self.fetch_history_via_connector(symbol, timeframe, start, end)
+
+
+# ---------------------------------------------------------------------------
+# Claude + MCP stub (shared with broker.py)
+# ---------------------------------------------------------------------------
+def _call_claude_with_mcp(
+    cfg: Config,
+    prompt: str,
+    mcp_url_key: str,
+    mcp_name_key: str,
+) -> Any:
+    """STUB. Single point of contact with the Claude API.
+
+    The real call should look roughly like:
+
+        from anthropic import Anthropic
+        client = Anthropic(api_key=cfg.connector["anthropic_api_key"])
+        msg = client.messages.create(
+            model=cfg.connector.get("claude_model", "claude-sonnet-4-6"),
+            max_tokens=4096,
+            mcp_servers=[{
+                "type": "url",
+                "url":  cfg.connector[mcp_url_key],
+                "name": cfg.connector[mcp_name_key],
+            }],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return _extract_json_from_message(msg)
+
+    Kept as a NotImplementedError so a misconfigured run fails loudly instead
+    of silently sending traffic. Wire it up once your MCP servers are ready.
+    """
+    require_online(cfg, "_call_claude_with_mcp")
+    raise NotImplementedError(
+        "_call_claude_with_mcp is a stub. Implement against the Anthropic SDK "
+        "with mcp_servers configured (see the docstring for the shape)."
+    )
+
+
+def _rows_to_ohlcv_df(payload: Any) -> pd.DataFrame:
+    """Parse a JSON-array OHLCV payload returned by the Claude+MCP call."""
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    df = pd.DataFrame(payload)
+    return _normalize_ohlcv(df)
 
 
 # ---------------------------------------------------------------------------

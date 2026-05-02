@@ -1,23 +1,25 @@
 """Broker layer.
 
 - ``SimulatedBroker``  : offline fills against bar prices, persists state.
-- ``ConnectorBroker``  : paper-only routing through a user-supplied connector.
+- ``ConnectorBroker``  : paper-only routing through Claude + your MCP server.
 
 Hard safety rules (enforced in both brokers and at module load):
   * ``cfg.LIVE_TRADING`` MUST be False.
   * Live/mainnet endpoints in env or connector config abort startup.
+  * Network calls refuse to run while ``cfg.OFFLINE_MODE=True``.
   * Risk + exposure limits checked before any order is sized down or rejected.
 """
 from __future__ import annotations
 
+import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Mapping, Optional
+from dataclasses import dataclass, asdict
+from typing import Any, Mapping, Optional
 
 import pandas as pd
 
-from config import Config, LiveTradingBlocked, assert_paper_only
+from config import Config, LiveTradingBlocked, assert_paper_only, require_online
 from portfolio import Fill, Portfolio
 from strategy import Signal
 
@@ -99,7 +101,21 @@ def size_order(
     cash_qty = portfolio.cash / price
     qty = min(qty, cash_qty)
 
-    # Floor to whole shares for equities. Easy to relax for fractional/crypto.
+    return _floor_qty(signal.symbol, qty)
+
+
+# Crypto quote-currency suffixes that imply fractional sizing.
+_FRACTIONAL_QUOTE_SUFFIXES: tuple[str, ...] = ("USDT", "USDC", "BUSD", "FDUSD", "DAI", "TUSD")
+
+
+def _floor_qty(symbol: str, qty: float) -> float:
+    """Round trade qty to a venue-realistic precision.
+
+    - Crypto pairs (suffix in ``_FRACTIONAL_QUOTE_SUFFIXES``): 4 decimals.
+    - Everything else (equities): whole shares.
+    """
+    if any(symbol.upper().endswith(s) for s in _FRACTIONAL_QUOTE_SUFFIXES):
+        return float(int(qty * 10_000)) / 10_000
     return float(int(qty))
 
 
@@ -157,11 +173,11 @@ class SimulatedBroker(Broker):
 # Connector-backed broker (paper API). Adapter stubs only.
 # ---------------------------------------------------------------------------
 class ConnectorBroker(Broker):
-    """Routes orders through a user-supplied paper API.
+    """Routes paper orders through Claude + your MCP broker server.
 
-    The two ``*_via_connector`` methods are the only network surface. The
-    constructor double-checks that nothing in env / connector config points
-    at a live venue.
+    The two ``*_via_connector`` methods are the only network surface, and both
+    refuse to run while ``cfg.OFFLINE_MODE=True``. The constructor also
+    double-checks that nothing in env / connector config points at a live venue.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -172,20 +188,51 @@ class ConnectorBroker(Broker):
             )
         self.cfg = cfg
 
-    # ---- Adapter methods -------------------------------------------------
+    # ---- Adapter methods (Claude + MCP) ---------------------------------
     def submit_paper_order_via_connector(self, order: Order) -> Fill:
-        """ADAPTER STUB. Wire up to your paper broker / testnet here.
+        """STUB. Submits the order via Claude with the broker MCP attached.
 
-        MUST verify the destination is a paper/testnet endpoint before
-        sending. Anything else should raise ``LiveTradingBlocked``.
+        MUST verify the destination is a paper/testnet endpoint before sending.
+        Anything else should raise ``LiveTradingBlocked``.
         """
+        if not self.cfg.OFFLINE_MODE:
+            require_online(self.cfg, "submit_paper_order_via_connector")
+            order_payload = {**asdict(order), "timestamp": str(order.timestamp)}
+            prompt = (
+                "Use the configured paper-broker MCP tool to submit the "
+                "following PAPER order. Refuse if the connected venue is not "
+                "paper/testnet. Reply with ONLY a JSON object containing the "
+                "fill: {timestamp, symbol, side, qty, price, fees, reason}.\n\n"
+                f"ORDER:\n{json.dumps(order_payload, default=str)}"
+            )
+            payload = _call_claude_with_mcp(
+                cfg=self.cfg,
+                prompt=prompt,
+                mcp_url_key="broker_mcp_url",
+                mcp_name_key="broker_mcp_name",
+            )
+            return _payload_to_fill(payload)
         raise NotImplementedError(
             "ConnectorBroker.submit_paper_order_via_connector is not wired up. "
-            "Implement against your paper API (e.g. Alpaca paper, Bybit testnet)."
+            "Set OFFLINE_MODE=False and populate cfg.connector first."
         )
 
     def fetch_account_via_connector(self) -> dict:
-        """ADAPTER STUB. Return account snapshot (cash, positions, equity)."""
+        """STUB. Returns an account snapshot (cash, positions, equity)."""
+        if not self.cfg.OFFLINE_MODE:
+            require_online(self.cfg, "fetch_account_via_connector")
+            payload = _call_claude_with_mcp(
+                cfg=self.cfg,
+                prompt=(
+                    "Use the configured paper-broker MCP tool to fetch the "
+                    "current account snapshot. Reply with ONLY a JSON object "
+                    "with keys: cash, equity, positions (list of "
+                    "{symbol, qty, avg_price})."
+                ),
+                mcp_url_key="broker_mcp_url",
+                mcp_name_key="broker_mcp_name",
+            )
+            return payload if isinstance(payload, dict) else json.loads(payload)
         raise NotImplementedError(
             "ConnectorBroker.fetch_account_via_connector is not wired up."
         )
@@ -200,6 +247,11 @@ class ConnectorBroker(Broker):
     ) -> list[Fill]:
         if self.cfg.LIVE_TRADING:
             raise LiveTradingBlocked("LIVE_TRADING=True; refusing to send orders.")
+        if self.cfg.OFFLINE_MODE:
+            raise RuntimeError(
+                "ConnectorBroker.execute_signals called in OFFLINE_MODE; "
+                "use SimulatedBroker instead."
+            )
         fills: list[Fill] = []
         for sig in signals:
             mark = marks.get(sig.symbol)
@@ -221,6 +273,55 @@ class ConnectorBroker(Broker):
             portfolio.apply_fill(fill)
             fills.append(fill)
         return fills
+
+
+# ---------------------------------------------------------------------------
+# Claude + MCP stub. Mirrors data_feed._call_claude_with_mcp but kept local
+# so neither module imports the other's internals.
+# ---------------------------------------------------------------------------
+def _call_claude_with_mcp(
+    cfg: Config,
+    prompt: str,
+    mcp_url_key: str,
+    mcp_name_key: str,
+) -> Any:
+    """STUB. Single point of contact with the Claude API. Refuses while offline.
+
+    Real implementation (sketch):
+
+        from anthropic import Anthropic
+        client = Anthropic(api_key=cfg.connector["anthropic_api_key"])
+        msg = client.messages.create(
+            model=cfg.connector.get("claude_model", "claude-sonnet-4-6"),
+            max_tokens=4096,
+            mcp_servers=[{
+                "type": "url",
+                "url":  cfg.connector[mcp_url_key],
+                "name": cfg.connector[mcp_name_key],
+            }],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return _extract_json_from_message(msg)
+    """
+    require_online(cfg, "_call_claude_with_mcp")
+    raise NotImplementedError(
+        "_call_claude_with_mcp is a stub. Implement against the Anthropic SDK "
+        "with mcp_servers configured (see the docstring for the shape)."
+    )
+
+
+def _payload_to_fill(payload: Any) -> Fill:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return Fill(
+        timestamp=pd.Timestamp(payload["timestamp"]),
+        symbol=payload["symbol"],
+        side=payload["side"],
+        qty=float(payload["qty"]),
+        price=float(payload["price"]),
+        fees=float(payload.get("fees", 0.0)),
+        reason=payload.get("reason", ""),
+    )
 
 
 def build_broker(cfg: Config) -> Broker:
